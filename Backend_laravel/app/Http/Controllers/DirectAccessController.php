@@ -1,0 +1,668 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Log;
+use PDO;
+use Exception;
+
+class DirectAccessController extends Controller
+{
+    //Lire depuis access
+    public function searchArticles(Request $request): JsonResponse
+    {
+        try {
+            // Vérifier qu'un dossier est sélectionné
+            if (!$request->session()->isStarted()) {
+                $request->session()->start();
+            }
+
+            $selectedFolder = $request->session()->get('selected_folder');
+            if (!$selectedFolder) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Aucun dossier sélectionné. Veuillez d\'abord sélectionner un dossier.',
+                    'redirect' => '/folder-selection'
+                ], 400);
+            }
+
+            $request->validate([
+                'search' => 'nullable|string|max:100',
+                'family' => 'nullable|string|max:50',
+                'page' => 'nullable|integer|min:1',
+                'limit' => 'nullable|integer|min:1|max:100'
+            ]);
+
+            $searchTerm = $request->input('search', '');
+            $familyFilter = $request->input('family', '');
+            $page = $request->input('page', 1);
+            $limit = $request->input('limit', 20);
+            $offset = ($page - 1) * $limit;
+
+            // Obtenir les chemins Access
+            $accessDbPath = $this->getAccessDbPath($selectedFolder);
+            $facturationDbPath = $this->getFacturationDbPath($selectedFolder);
+            
+            if (!file_exists($accessDbPath)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Fichier Access non trouvé: $accessDbPath"
+                ], 404);
+            }
+            $accessPdo = $this->connectToAccess($accessDbPath);
+            $whereConditions = [];
+            $params = [];
+
+            if (!empty($searchTerm)) {
+                $whereConditions[] = "LCASE(Libelle) LIKE LCASE(?)";
+                $params[] = "%$searchTerm%";
+            }
+
+            if (!empty($familyFilter)) {
+                $whereConditions[] = "LCASE(CodeFam) LIKE LCASE(?)";
+                $params[] = "%$familyFilter%";
+            }
+
+            $whereClause = !empty($whereConditions) ? 'WHERE ' . implode(' AND ', $whereConditions) : '';
+
+            // Compter le total 
+            $countQuery = "SELECT COUNT(*) as total FROM Article $whereClause";
+            $countStmt = $accessPdo->prepare($countQuery);
+            $countStmt->execute($params);
+            $total = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
+
+            $articles = [];
+            
+            if ($page == 1) {
+                $query = "SELECT TOP $limit Code, Libelle, CodeFam, BaseTTC 
+                         FROM Article 
+                         $whereClause 
+                         ORDER BY Libelle";
+                
+                $stmt = $accessPdo->prepare($query);
+                $stmt->execute($params);
+                $articles = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                
+            } else {
+                
+                $totalToFetch = $page * $limit;
+                
+                $query = "SELECT TOP $totalToFetch Code, Libelle, CodeFam, BaseTTC 
+                         FROM Article 
+                         $whereClause 
+                         ORDER BY Libelle";
+                
+                $stmt = $accessPdo->prepare($query);
+                $stmt->execute($params);
+                $allArticles = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                
+                $articles = array_slice($allArticles, $offset, $limit);
+            }
+
+            // Récupérer les stocks depuis caiss_facturation.mdb
+            $stocksData = $this->getStocksForArticles($articles, $facturationDbPath);
+
+            // Formater les résultats 
+            $formattedArticles = array_map(function($article) use ($stocksData) {
+                $code = $this->fixEncoding($article['Code'] ?? '');
+                $stock = $stocksData[$code] ?? 0; // Stock par défaut à 0
+                
+                return [
+                    'code' => $code,
+                    'libelle' => $this->fixEncoding($article['Libelle'] ?? ''),
+                    'famille' => $this->fixEncoding($article['CodeFam'] ?? ''),
+                    'prix_ttc' => number_format(($article['BaseTTC'] ?? 0), 2, '.', ''),
+                    'prix_display' => number_format(($article['BaseTTC'] ?? 0), 2, ',', ' ') . ' Ar',
+                    'stock' => $stock,
+                    'stock_display' => $stock . ' unité' . ($stock > 1 ? 's' : ''),
+                    'stock_status' => $this->getStockStatus($stock)
+                ];
+            }, $articles);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'articles' => $formattedArticles,
+                    'pagination' => [
+                        'current_page' => $page,
+                        'total_pages' => ceil($total / $limit),
+                        'total_items' => $total,
+                        'items_per_page' => $limit,
+                        'has_next' => $page < ceil($total / $limit),
+                        'has_prev' => $page > 1
+                    ],
+                    'search_info' => [
+                        'search_term' => $searchTerm,
+                        'family_filter' => $familyFilter,
+                        'results_count' => count($formattedArticles)
+                    ]
+                ]
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('Erreur lors de la recherche directe Access', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la recherche: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+      //Récupérer les stocks depuis caiss_facturation.mdb
+    private function getStocksForArticles(array $articles, string $facturationDbPath): array
+    {
+        $stocks = [];
+        
+        try {
+            // Vérifier si le fichier caiss_facturation.mdb existe
+            if (!file_exists($facturationDbPath)) {
+                Log::warning('Fichier caiss_facturation.mdb non trouvé', [
+                    'path' => $facturationDbPath
+                ]);
+                return $stocks; 
+            }
+
+            $facturationPdo = $this->connectToAccess($facturationDbPath);
+            
+            $articleCodes = array_map(function($article) {
+                return $this->fixEncoding($article['Code'] ?? '');
+            }, $articles);
+
+            if (empty($articleCodes)) {
+                return $stocks;
+            }
+
+            $placeholders = str_repeat('?,', count($articleCodes) - 1) . '?';
+            
+            $stockQuery = "SELECT CodeArticle, SUM(Quantite) as TotalStock 
+                          FROM Mouvementstock 
+                          WHERE CodeArticle IN ($placeholders)
+                          GROUP BY CodeArticle";
+
+            $stmt = $facturationPdo->prepare($stockQuery);
+            $stmt->execute($articleCodes);
+            $stockResults = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            // Traiter les résultats avec encodage
+            foreach ($stockResults as $stockRow) {
+                $codeArticle = $this->fixEncoding($stockRow['CodeArticle'] ?? '');
+                $totalStock = intval($stockRow['TotalStock'] ?? 0);
+                $stocks[$codeArticle] = $totalStock;
+            }
+
+            Log::info('Stocks récupérés depuis caiss_facturation', [
+                'articles_count' => count($articleCodes),
+                'stocks_found' => count($stocks),
+                'facturation_path' => $facturationDbPath
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('Erreur lors de la récupération des stocks', [
+                'error' => $e->getMessage(),
+                'facturation_path' => $facturationDbPath
+            ]);
+            
+        }
+
+        return $stocks;
+    }
+
+    //Déterminer le statut du stock
+    private function getStockStatus(int $stock): string
+    {
+        if ($stock <= 0) {
+            return 'rupture';
+        } elseif ($stock <= 5) {
+            return 'faible';
+        } elseif ($stock <= 20) {
+            return 'moyen';
+        } else {
+            return 'bon';
+        }
+    }
+
+    //Obtenir le chemin du fichier caiss_facturation.mdb
+    private function getFacturationDbPath($selectedFolder): string
+    {
+        if (isset($selectedFolder['stored_file_path'])) {
+            $caissPath = storage_path('app/' . $selectedFolder['stored_file_path']);
+            $folderPath = dirname($caissPath);
+            return $folderPath . DIRECTORY_SEPARATOR . 'caiss_facturation.mdb';
+        } else if (isset($selectedFolder['folder_path'])) {
+            $folderPath = $selectedFolder['folder_path'];
+            $normalizedPath = str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $folderPath);
+            return $normalizedPath . DIRECTORY_SEPARATOR . 'caiss_facturation.mdb';
+        }
+        
+        throw new Exception('Aucun chemin caiss_facturation.mdb disponible');
+    }
+
+    //Corriger l'encodage des données Access
+    private function fixEncoding($value): string
+    {
+        if (empty($value)) {
+            return '';
+        }
+        if (mb_check_encoding($value, 'UTF-8')) {
+            return $value;
+        }
+        $encodings = ['Windows-1252', 'ISO-8859-1', 'CP1252', 'UTF-8'];
+        
+        foreach ($encodings as $encoding) {
+            $converted = @mb_convert_encoding($value, 'UTF-8', $encoding);
+            if ($converted !== false && mb_check_encoding($converted, 'UTF-8')) {
+                return $converted;
+            }
+        }
+
+        return mb_convert_encoding($value, 'UTF-8', 'UTF-8');
+    }
+
+    //Obtenir les familles directement depuis Access 
+    public function getFamilies(Request $request): JsonResponse
+    {
+        try {
+            if (!$request->session()->isStarted()) {
+                $request->session()->start();
+            }
+
+            $selectedFolder = $request->session()->get('selected_folder');
+            if (!$selectedFolder) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Aucun dossier sélectionné.'
+                ], 400);
+            }
+
+            $accessDbPath = $this->getAccessDbPath($selectedFolder);
+            $accessPdo = $this->connectToAccess($accessDbPath);
+
+            $stmt = $accessPdo->prepare("
+                SELECT DISTINCT CodeFam 
+                FROM Article 
+                WHERE CodeFam IS NOT NULL AND CodeFam <> '' 
+                ORDER BY CodeFam
+            ");
+            $stmt->execute();
+            $rawFamilies = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+            $families = array_map([$this, 'fixEncoding'], $rawFamilies);
+
+            return response()->json([
+                'success' => true,
+                'data' => $families
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('Erreur lors de la récupération des familles', [
+                'error' => $e->getMessage()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la récupération des familles.'
+            ], 500);
+        }
+    }
+
+  //Connexion directe à Access via ODBC
+    private function connectToAccess(string $accessDbPath): PDO
+    {
+        try {
+            $dsn = "odbc:DRIVER={Microsoft Access Driver (*.mdb, *.accdb)};DBQ=" . $accessDbPath . ";";
+            
+            $pdo = new PDO($dsn);
+            $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+            $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+            
+            return $pdo;
+            
+        } catch (Exception $e) {
+            throw new Exception("Erreur connexion Access: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Obtenir le chemin du fichier Access
+     */
+    private function getAccessDbPath($selectedFolder): string
+    {
+        if (isset($selectedFolder['stored_file_path'])) {
+            return storage_path('app/' . $selectedFolder['stored_file_path']);
+        } else if (isset($selectedFolder['folder_path'])) {
+            $folderPath = $selectedFolder['folder_path'];
+            $normalizedPath = str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $folderPath);
+            return $normalizedPath . DIRECTORY_SEPARATOR . 'Caiss.mdb';
+        }
+        
+        throw new Exception('Aucun chemin Access disponible');
+    }
+
+    /**
+     * Tester la connexion Access 
+     */
+    public function testConnection(Request $request): JsonResponse
+    {
+        try {
+            if (!$request->session()->isStarted()) {
+                $request->session()->start();
+            }
+
+            $selectedFolder = $request->session()->get('selected_folder');
+            if (!$selectedFolder) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Aucun dossier sélectionné.'
+                ], 400);
+            }
+
+            $accessDbPath = $this->getAccessDbPath($selectedFolder);
+            $facturationDbPath = $this->getFacturationDbPath($selectedFolder);
+            
+            if (!file_exists($accessDbPath)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => "Fichier non trouvé: $accessDbPath"
+                ], 404);
+            }
+
+            $accessPdo = $this->connectToAccess($accessDbPath);
+            
+            $stmt = $accessPdo->query("SELECT COUNT(*) as total FROM Article");
+            $result = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            $sampleStmt = $accessPdo->query("SELECT TOP 3 Code, Libelle FROM Article");
+            $samples = $sampleStmt->fetchAll(PDO::FETCH_ASSOC);
+            
+            $fixedSamples = array_map(function($sample) {
+                return [
+                    'code' => $this->fixEncoding($sample['Code'] ?? ''),
+                    'libelle' => $this->fixEncoding($sample['Libelle'] ?? '')
+                ];
+            }, $samples);
+
+            $facturationStatus = [
+                'available' => false,
+                'path' => $facturationDbPath,
+                'total_movements' => 0
+            ];
+
+            try {
+                if (file_exists($facturationDbPath)) {
+                    $facturationPdo = $this->connectToAccess($facturationDbPath);
+                    $stockStmt = $facturationPdo->query("SELECT COUNT(*) as total FROM Mouvementstock");
+                    $stockResult = $stockStmt->fetch(PDO::FETCH_ASSOC);
+                    
+                    $facturationStatus['available'] = true;
+                    $facturationStatus['total_movements'] = $stockResult['total'];
+                }
+            } catch (Exception $e) {
+                Log::warning('Erreur connexion caiss_facturation', ['error' => $e->getMessage()]);
+            }
+            
+            return response()->json([
+                'success' => true,
+                'message' => 'Connexion Access réussie',
+                'data' => [
+                    'file_path' => $accessDbPath,
+                    'total_articles' => $result['total'],
+                    'encoding_test' => $fixedSamples,
+                    'facturation_db' => $facturationStatus
+                ]
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('Erreur test connexion Access', [
+                'error' => $e->getMessage()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur connexion: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Obtenir les infos de structure de la table Article
+     */
+    public function getTableStructure(Request $request): JsonResponse
+    {
+        try {
+            if (!$request->session()->isStarted()) {
+                $request->session()->start();
+            }
+
+            $selectedFolder = $request->session()->get('selected_folder');
+            if (!$selectedFolder) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Aucun dossier sélectionné.'
+                ], 400);
+            }
+
+            $accessDbPath = $this->getAccessDbPath($selectedFolder);
+            $accessPdo = $this->connectToAccess($accessDbPath);
+
+            // Lister les colonnes de la table Article
+            $stmt = $accessPdo->query("SELECT TOP 1 * FROM Article");
+            $rawSampleRow = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            $columns = $rawSampleRow ? array_keys($rawSampleRow) : [];
+            
+            // Corriger l'encodage de l'échantillon
+            $sampleRow = [];
+            if ($rawSampleRow) {
+                foreach ($rawSampleRow as $key => $value) {
+                    $sampleRow[$key] = is_string($value) ? $this->fixEncoding($value) : $value;
+                }
+            }
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'table_name' => 'Article',
+                    'columns' => $columns,
+                    'sample_row' => $sampleRow
+                ]
+            ]);
+
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur structure: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+
+    /**
+     * Récupérer les données d'un ticket depuis Caiss_frontoffice.mdb
+     */
+    public function getTicketDetails(Request $request, $codeTicket): JsonResponse
+{
+    try {
+        if (!$request->session()->isStarted()) {
+            $request->session()->start();
+        }
+
+        $selectedFolder = $request->session()->get('selected_folder');
+        if (!$selectedFolder) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Aucun dossier sélectionné.'
+            ], 400);
+        }
+
+        // Validation du paramètre de route 
+        if (empty($codeTicket) || strlen(trim($codeTicket)) < 2) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Code ticket requis et doit contenir au moins 2 caractères'
+            ], 400);
+        }
+
+        // Nettoyer le code ticket
+        $codeTicket = trim($codeTicket);
+        
+        $frontofficeDbPath = $this->getFrontofficeDbPath($selectedFolder);
+        
+        if (!file_exists($frontofficeDbPath)) {
+            return response()->json([
+                'success' => false,
+                'message' => "Fichier Caiss_frontoffice.mdb non trouvé: $frontofficeDbPath"
+            ], 404);
+        }
+        $frontofficePdo = $this->connectToAccess($frontofficeDbPath);
+
+        $ticketQuery = "SELECT Id, Code FROM Ticket WHERE Code = ?";
+        $ticketStmt = $frontofficePdo->prepare($ticketQuery);
+        $ticketStmt->execute([$codeTicket]);
+        $ticket = $ticketStmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$ticket) {
+            return response()->json([
+                'success' => false,
+                'message' => "Aucun ticket trouvé avec le code: $codeTicket"
+            ], 404);
+        }
+
+        $lignesQuery = "SELECT CodeDoc, Designation, Qte FROM TicketLigne WHERE CodeDoc = ?";
+        $lignesStmt = $frontofficePdo->prepare($lignesQuery);
+        $lignesStmt->execute([$ticket['Id']]);
+        $lignes = $lignesStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $medicaments = array_map(function($ligne) {
+            return [
+                'code_doc' => $ligne['CodeDoc'],
+                'designation' => $this->fixEncoding($ligne['Designation'] ?? ''),
+                'quantite' => intval($ligne['Qte'] ?? 0),
+                'posologie' => '',
+                'duree' => '' 
+            ];
+        }, $lignes);
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'ticket' => [
+                    'id' => $ticket['Id'],
+                    'code' => $this->fixEncoding($ticket['Code']),
+                ],
+                'medicaments' => $medicaments,
+                'total_medicaments' => count($medicaments)
+            ],
+            'message' => 'Données du ticket récupérées avec succès'
+        ]);
+
+    } catch (Exception $e) {
+        Log::error('Erreur lors de la récupération du ticket', [
+            'code_ticket' => $codeTicket ?? 'N/A',
+            'error' => $e->getMessage(),
+            'trace' => $e->getTraceAsString()
+        ]);
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Erreur lors de la récupération du ticket: ' . $e->getMessage()
+        ], 500);
+    }
+}
+
+    /**
+     * Rechercher des tickets par code
+     */
+    public function searchTickets(Request $request): JsonResponse
+    {
+        try {
+            if (!$request->session()->isStarted()) {
+                $request->session()->start();
+            }
+
+            $selectedFolder = $request->session()->get('selected_folder');
+            if (!$selectedFolder) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Aucun dossier sélectionné.'
+                ], 400);
+            }
+
+            $request->validate([
+                'search' => 'required|string|min:2|max:50',
+                'limit' => 'nullable|integer|min:1|max:20'
+            ]);
+
+            $search = $request->input('search');
+            $limit = $request->input('limit', 10);
+
+            $frontofficeDbPath = $this->getFrontofficeDbPath($selectedFolder);
+            
+            if (!file_exists($frontofficeDbPath)) {
+                return response()->json([
+                    'success' => true,
+                    'data' => []
+                ]);
+            }
+
+            $frontofficePdo = $this->connectToAccess($frontofficeDbPath);
+
+            // Rechercher les tickets par code
+            $searchQuery = "SELECT TOP $limit Id, Code FROM Ticket 
+                           WHERE LCASE(Code) LIKE LCASE(?) 
+                           ORDER BY Code DESC";
+            
+            $stmt = $frontofficePdo->prepare($searchQuery);
+            $stmt->execute(["%$search%"]);
+            $tickets = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+            // Formater les résultats
+            $formattedTickets = array_map(function($ticket) {
+                return [
+                    'id' => $ticket['Id'],
+                    'code' => $this->fixEncoding($ticket['Code']),
+                    'display' => $this->fixEncoding($ticket['Code'])
+                ];
+            }, $tickets);
+
+            return response()->json([
+                'success' => true,
+                'data' => $formattedTickets
+            ]);
+
+        } catch (Exception $e) {
+            Log::error('Erreur lors de la recherche de tickets', [
+                'search' => $request->input('search'),
+                'error' => $e->getMessage()
+            ]);
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la recherche'
+            ], 500);
+        }
+    }
+
+    /**
+     * Obtenir le chemin du fichier Caiss_frontoffice.mdb
+     */
+    private function getFrontofficeDbPath($selectedFolder): string
+    {
+        if (isset($selectedFolder['stored_file_path'])) {
+            $caissPath = storage_path('app/' . $selectedFolder['stored_file_path']);
+            $folderPath = dirname($caissPath);
+            return $folderPath . DIRECTORY_SEPARATOR . 'Caiss_frontoffice.mdb';
+        } else if (isset($selectedFolder['folder_path'])) {
+            $folderPath = $selectedFolder['folder_path'];
+            $normalizedPath = str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $folderPath);
+            return $normalizedPath . DIRECTORY_SEPARATOR . 'Caiss_frontoffice.mdb';
+        }
+        
+        throw new Exception('Aucun chemin Caiss_frontoffice.mdb disponible');
+    }
+}

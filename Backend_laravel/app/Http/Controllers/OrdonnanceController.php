@@ -1,0 +1,1781 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Http\Controllers\Controller;
+use App\Models\Ordonnance;
+use App\Models\OrdonnanceLigne;
+use App\Models\Client;
+use App\Models\Medecin;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Validation\ValidationException;
+use Illuminate\Support\Facades\DB;
+use Exception;
+
+class OrdonnanceController extends Controller
+{
+    /**
+     * Vérifier qu'un dossier est sélectionné avant toute opération
+     */
+    private function checkDossierSelection(Request $request)
+    {
+        if (!$request->has('current_dossier_vente') || !$request->get('current_dossier_vente')) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Aucun dossier de vente sélectionné. Veuillez d\'abord sélectionner un dossier.',
+                'error_code' => 'NO_FOLDER_SELECTED'
+            ], 400);
+        }
+        return null;
+    }
+
+    /**
+     * Liste paginée des ordonnances avec recherche
+     */
+    public function index(Request $request): JsonResponse
+    {
+        // Vérifier la sélection du dossier
+        $folderCheck = $this->checkDossierSelection($request);
+        if ($folderCheck) return $folderCheck;
+
+        try {
+            $perPage = min($request->get('per_page', 20), 100);
+            $search = $request->get('search');
+            $medecinId = $request->get('medecin_id');
+            $clientId = $request->get('client_id');
+            $dateDebut = $request->get('date_debut');
+            $dateFin = $request->get('date_fin');
+
+            $ordonnances = Ordonnance::with(['medecin', 'client'])
+                ->when($search, function ($query, $search) {
+                    $query->search($search);
+                })
+                ->when($medecinId, function ($query, $medecinId) {
+                    $query->byMedecin($medecinId);
+                })
+                ->when($clientId, function ($query, $clientId) {
+                    $query->byClient($clientId);
+                })
+                ->when($dateDebut || $dateFin, function ($query) use ($dateDebut, $dateFin) {
+                    $query->byDateRange($dateDebut, $dateFin);
+                })
+                ->orderBy('date', 'desc')
+                ->orderBy('created_at', 'desc')
+                ->paginate($perPage);
+
+            // Ajouter le nombre de médicaments pour chaque ordonnance
+            $ordonnances->getCollection()->transform(function ($ordonnance) {
+                $ordonnance->total_medicaments = $ordonnance->lignes()->count();
+                return $ordonnance;
+            });
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'ordonnances' => $ordonnances->items(),
+                    'pagination' => [
+                        'current_page' => $ordonnances->currentPage(),
+                        'last_page' => $ordonnances->lastPage(),
+                        'per_page' => $ordonnances->perPage(),
+                        'total' => $ordonnances->total(),
+                        'from' => $ordonnances->firstItem(),
+                        'to' => $ordonnances->lastItem(),
+                    ],
+                    'current_dossier' => $request->get('current_dossier_vente')
+                ],
+                'message' => 'Ordonnances récupérées avec succès'
+            ]);
+
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la récupération des ordonnances',
+                'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+    /**
+     * Créer une nouvelle ordonnance
+     */
+    public function store(Request $request): JsonResponse
+    {
+        // Vérifier la sélection du dossier
+        $folderCheck = $this->checkDossierSelection($request);
+        if ($folderCheck) return $folderCheck;
+
+        try {
+            $currentDossier = $request->get('current_dossier_vente');
+
+            $validated = $request->validate([
+                'numero_ordonnance' => [
+                    'required',
+                    'string',
+                    'max:50',
+                    function ($attribute, $value, $fail) use ($currentDossier) {
+                        if (Ordonnance::numeroExists($value, $currentDossier)) {
+                            $fail("Ce numéro d'ordonnance existe déjà dans le dossier $currentDossier");
+                        }
+                    }
+                ],
+                'medecin_id' => 'required|exists:medecins,id',
+                'date' => 'required|date',
+                
+                // Données client
+                'client_id' => 'nullable|exists:clients,id',
+                'client' => 'required_without:client_id|array',
+                'client.nom_complet' => 'required_without:client_id|string|max:255',
+                'client.adresse' => 'required_without:client_id|string|max:255',
+                'client.telephone' => 'nullable|string|max:20',
+                
+                // Médicaments prescrits
+                'medicaments' => 'required|array|min:1',
+                'medicaments.*.code_medicament' => 'required|string|max:50',
+                'medicaments.*.designation' => 'required|string|max:255',
+                'medicaments.*.quantite' => 'required|integer|min:1',
+                'medicaments.*.posologie' => 'required|string|max:500',
+                'medicaments.*.duree' => 'required|string|max:100',
+            ], [
+                'numero_ordonnance.required' => 'Le numéro d\'ordonnance est obligatoire',
+                'medecin_id.required' => 'Veuillez sélectionner un médecin',
+                'medecin_id.exists' => 'Le médecin sélectionné n\'existe pas',
+            ]);
+
+            DB::beginTransaction();
+
+            if ($request->has('client_id') && $request->client_id) {
+                $client = Client::findOrFail($request->client_id);
+            } else {
+                $client = Client::create($validated['client']);
+            }
+
+            $ordonnance = Ordonnance::create([
+                'numero_ordonnance' => $validated['numero_ordonnance'],
+                'date' => $validated['date'],
+                'medecin_id' => $validated['medecin_id'],
+                'client_id' => $client->id,
+            ]);
+
+            foreach ($validated['medicaments'] as $medicament) {
+                OrdonnanceLigne::create([
+                    'ordonnance_id' => $ordonnance->id,
+                    'code_medicament' => $medicament['code_medicament'],
+                    'designation' => $medicament['designation'],
+                    'quantite' => $medicament['quantite'],
+                    'posologie' => $medicament['posologie'],
+                    'duree' => $medicament['duree'],
+                ]);
+            }
+
+            DB::commit();
+
+            // Charger les relations pour la réponse
+            $ordonnance->load(['medecin', 'client', 'lignes']);
+
+            return response()->json([
+                'success' => true,
+                'data' => $ordonnance,
+                'message' => "Ordonnance créée avec succès dans le dossier $currentDossier"
+            ], 201);
+
+        } catch (ValidationException $e) {
+            DB::rollback();
+            return response()->json([
+                'success' => false,
+                'message' => 'Données de validation incorrectes',
+                'errors' => $e->errors()
+            ], 422);
+        } catch (Exception $e) {
+            DB::rollback();
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la création de l\'ordonnance',
+                'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+    /**
+     * Afficher une ordonnance spécifique
+     */
+    public function show(Ordonnance $ordonnance): JsonResponse
+    {
+        try {
+            $ordonnance->load(['medecin', 'client', 'lignes']);
+
+            return response()->json([
+                'success' => true,
+                'data' => $ordonnance
+            ]);
+
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la récupération de l\'ordonnance',
+                'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+    /**
+     * Mettre à jour une ordonnance
+     */
+    public function update(Request $request, Ordonnance $ordonnance): JsonResponse
+    {
+        // Vérifier la sélection du dossier
+        $folderCheck = $this->checkDossierSelection($request);
+        if ($folderCheck) return $folderCheck;
+
+        try {
+            $validated = $request->validate([
+                'medecin_id' => 'required|exists:medecins,id',
+                'date' => 'required|date',
+                
+                // Données client modifiables
+                'client.nom_complet' => 'required|string|max:255',
+                'client.adresse' => 'required|string|max:255',
+                'client.telephone' => 'nullable|string|max:20',
+                
+                // Médicaments - posologie et durée modifiables
+                'medicaments' => 'required|array|min:1',
+                'medicaments.*.id' => 'nullable|exists:ordonnance_lignes,id',
+                'medicaments.*.code_medicament' => 'required|string|max:50',
+                'medicaments.*.designation' => 'required|string|max:255',
+                'medicaments.*.quantite' => 'required|integer|min:1',
+                'medicaments.*.posologie' => 'required|string|max:500',
+                'medicaments.*.duree' => 'required|string|max:100',
+            ]);
+
+            DB::beginTransaction();
+            $ordonnance->update([
+                'medecin_id' => $validated['medecin_id'],
+                'date' => $validated['date'],
+            ]);
+
+            $ordonnance->client->update($validated['client']);
+
+            $existingIds = [];
+            
+            foreach ($validated['medicaments'] as $medicament) {
+                if (isset($medicament['id']) && $medicament['id']) {
+                    $ligne = OrdonnanceLigne::find($medicament['id']);
+                    if ($ligne && $ligne->ordonnance_id == $ordonnance->id) {
+                        $ligne->update([
+                            'code_medicament' => $medicament['code_medicament'],
+                            'designation' => $medicament['designation'],
+                            'quantite' => $medicament['quantite'],
+                            'posologie' => $medicament['posologie'],
+                            'duree' => $medicament['duree'],
+                        ]);
+                        $existingIds[] = $ligne->id;
+                    }
+                } else {
+                    // Créer nouveau médicament
+                    $nouvelleLigne = OrdonnanceLigne::create([
+                        'ordonnance_id' => $ordonnance->id,
+                        'code_medicament' => $medicament['code_medicament'],
+                        'designation' => $medicament['designation'],
+                        'quantite' => $medicament['quantite'],
+                        'posologie' => $medicament['posologie'],
+                        'duree' => $medicament['duree'],
+                    ]);
+                    $existingIds[] = $nouvelleLigne->id;
+                }
+            }
+
+            // Supprimer les lignes supprimées
+            OrdonnanceLigne::where('ordonnance_id', $ordonnance->id)
+                           ->whereNotIn('id', $existingIds)
+                           ->delete();
+
+            DB::commit();
+
+            // Recharger les données
+            $ordonnance->load(['medecin', 'client', 'lignes']);
+
+            return response()->json([
+                'success' => true,
+                'data' => $ordonnance,
+                'message' => 'Ordonnance modifiée avec succès'
+            ]);
+
+        } catch (ValidationException $e) {
+            DB::rollback();
+            return response()->json([
+                'success' => false,
+                'message' => 'Données de validation incorrectes',
+                'errors' => $e->errors()
+            ], 422);
+        } catch (Exception $e) {
+            DB::rollback();
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la modification de l\'ordonnance',
+                'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+    /**
+     * Supprimer une ordonnance
+     */
+    public function destroy(Ordonnance $ordonnance): JsonResponse
+    {
+        try {
+            DB::beginTransaction();
+            $ordonnance->delete();
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Ordonnance supprimée avec succès'
+            ]);
+
+        } catch (Exception $e) {
+            DB::rollback();
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la suppression de l\'ordonnance',
+                'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+/**
+ * Générer une version imprimable HTML de l'ordonnance
+ */
+public function generatePrintableHtml(Ordonnance $ordonnance): JsonResponse
+{
+    try {
+        $ordonnance->load(['medecin', 'client', 'lignes']);
+        $html = $this->buildPrintableHtml($ordonnance);
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'html' => $html,
+                'ordonnance' => $ordonnance,
+                'print_date' => now()->format('d/m/Y à H:i')
+            ],
+            'message' => 'Version imprimable générée avec succès'
+        ]);
+
+    } catch (Exception $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Erreur lors de la génération de l\'ordonnance imprimable',
+            'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+        ], 500);
+    }
+}
+
+private function buildPrintableHtml(Ordonnance $ordonnance): string
+{
+    $html = '
+    <!DOCTYPE html>
+    <html lang="fr">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Ordonnance ' . htmlspecialchars($ordonnance->numero_ordonnance) . '</title>
+        <style>
+            /* STYLES OPTIMISÉS POUR PDF ET IMPRESSION IDENTIQUES */
+            @media print, screen {
+                @page {
+                    margin: 1cm;
+                    size: A4 portrait;
+                }
+                body { 
+                    margin: 0; 
+                    padding: 0;
+                }
+                .no-print { 
+                    display: none !important; 
+                }
+            }
+            
+            body {
+                font-family: "Arial", "Helvetica", sans-serif;
+                font-size: 12pt;
+                line-height: 1.4;
+                color: #000000;
+                max-width: 21cm;
+                margin: 0 auto;
+                padding: 1cm;
+                background: #ffffff;
+                -webkit-print-color-adjust: exact;
+                color-adjust: exact;
+            }
+            
+            .ordonnance-header {
+                text-align: center;
+                border-bottom: 2px solid #2563eb;
+                padding-bottom: 15px;
+                margin-bottom: 25px;
+                page-break-after: avoid;
+            }
+            
+            .ordonnance-title {
+                font-size: 24pt;
+                font-weight: bold;
+                color: #1e40af;
+                margin-bottom: 5px;
+                line-height: 1.2;
+            }
+            
+            .ordonnance-info {
+                display: table;
+                width: 100%;
+                margin-bottom: 25px;
+                border-collapse: separate;
+                border-spacing: 10px;
+            }
+            
+            .info-section {
+                display: table-cell;
+                vertical-align: top;
+                width: 33.333%;
+                padding: 0 5px;
+            }
+            
+            .info-section h3 {
+                font-size: 14pt;
+                font-weight: bold;
+                color: #1f2937;
+                margin-bottom: 8px;
+                border-bottom: 1px solid #e5e7eb;
+                padding-bottom: 3px;
+                page-break-after: avoid;
+            }
+            
+            .info-section p {
+                margin: 4px 0;
+                font-size: 11pt;
+                line-height: 1.3;
+            }
+            
+            .info-label {
+                font-weight: bold;
+                display: inline-block;
+                width: 70px;
+                color: #374151;
+            }
+            
+            .medicaments-section {
+                margin-top: 30px;
+                page-break-inside: avoid;
+            }
+            
+            .medicaments-title {
+                font-size: 16pt;
+                font-weight: bold;
+                color: #1f2937;
+                margin-bottom: 15px;
+                text-align: center;
+                background-color: #f3f4f6;
+                padding: 8px;
+                border-radius: 4px;
+                page-break-after: avoid;
+            }
+            
+            .medicament-item {
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                padding: 15px;
+                margin-bottom: 12px;
+                background-color: #fafafa;
+                page-break-inside: avoid;
+            }
+            
+            .medicament-name {
+                font-size: 13pt;
+                font-weight: bold;
+                color: #1f2937;
+                margin-bottom: 8px;
+                page-break-after: avoid;
+            }
+            
+            .medicament-details {
+                display: table;
+                width: 100%;
+                border-collapse: separate;
+                border-spacing: 5px;
+            }
+            
+            .detail-item {
+                display: table-cell;
+                vertical-align: top;
+                width: 33.333%;
+            }
+            
+            .detail-label {
+                font-weight: bold;
+                color: #4b5563;
+                font-size: 10pt;
+                margin-bottom: 2px;
+                display: block;
+            }
+            
+            .detail-value {
+                color: #1f2937;
+                font-size: 11pt;
+                display: block;
+            }
+            
+            .ordonnance-footer {
+                margin-top: 40px;
+                display: table;
+                width: 100%;
+                border-top: 1px solid #e5e7eb;
+                padding-top: 20px;
+                page-break-inside: avoid;
+            }
+            
+            .print-info {
+                display: table-cell;
+                vertical-align: bottom;
+                width: 50%;
+                font-size: 9pt;
+                color: #6b7280;
+                text-align: left;
+            }
+            
+            .signature-section {
+                display: table-cell;
+                vertical-align: bottom;
+                width: 50%;
+                text-align: center;
+            }
+            
+            .signature-label {
+                font-size: 11pt;
+                font-weight: bold;
+                margin-bottom: 40px;
+                color: #4b5563;
+                display: block;
+            }
+            
+            .signature-line {
+                border-bottom: 1px solid #000000;
+                width: 180px;
+                margin: 0 auto;
+                height: 1px;
+            }
+            
+            /* CORRECTION : Styles spécifiques pour assurer la cohérence */
+            * {
+                box-sizing: border-box;
+            }
+            
+            /* Éviter les problèmes de rendu PDF */
+            img { max-width: 100%; height: auto; }
+            table { border-collapse: collapse; }
+            
+        </style>
+    </head>
+    <body>
+        <div class="ordonnance-container">
+            <!-- En-tête -->
+            <div class="ordonnance-header">
+                <h1 class="ordonnance-title">ORDONNANCE MÉDICALE</h1>
+            </div>
+            
+            <!-- Informations principales -->
+            <div class="ordonnance-info">
+                <!-- Médecin prescripteur -->
+                <div class="info-section">
+                    <h3>Médecin prescripteur</h3>
+                    <p><span class="info-label">Dr.</span> ' . htmlspecialchars($ordonnance->medecin->nom_complet) . '</p>
+                    <p><span class="info-label">ONM:</span> ' . htmlspecialchars($ordonnance->medecin->ONM) . '</p>';
+    
+    if ($ordonnance->medecin->adresse) {
+        $html .= '<p><span class="info-label">Adresse:</span> ' . htmlspecialchars($ordonnance->medecin->adresse) . '</p>';
+    }
+    
+    if ($ordonnance->medecin->telephone) {
+        $html .= '<p><span class="info-label">Tél:</span> ' . htmlspecialchars($ordonnance->medecin->telephone) . '</p>';
+    }
+    
+    $html .= '
+                </div>
+                
+                <!-- Patient -->
+                <div class="info-section">
+                    <h3>Patient</h3>
+                    <p><span class="info-label">Nom:</span> ' . htmlspecialchars($ordonnance->client->nom_complet) . '</p>
+                    <p><span class="info-label">Adresse:</span> ' . htmlspecialchars($ordonnance->client->adresse) . '</p>';
+    
+    if ($ordonnance->client->telephone) {
+        $html .= '<p><span class="info-label">Tél:</span> ' . htmlspecialchars($ordonnance->client->telephone) . '</p>';
+    }
+    
+    $html .= '
+                </div>
+                
+                <!-- Ordonnance -->
+                <div class="info-section">
+                    <h3>Ordonnance</h3>
+                    <p><span class="info-label">N°:</span> ' . htmlspecialchars($ordonnance->numero_ordonnance) . '</p>
+                    <p><span class="info-label">Date:</span> ' . $ordonnance->date->format('d/m/Y') . '</p>
+                    <p><span class="info-label">Dossier:</span> ' . htmlspecialchars($ordonnance->dossier_vente) . '</p>
+                </div>
+            </div>
+            
+            <!-- Médicaments prescrits -->
+            <div class="medicaments-section">
+                <h2 class="medicaments-title">MÉDICAMENTS PRESCRITS</h2>';
+    
+    foreach ($ordonnance->lignes as $index => $ligne) {
+        $html .= '
+                <div class="medicament-item">
+                    <div class="medicament-name">' . ($index + 1) . '. ' . htmlspecialchars($ligne->designation) . '</div>
+                    <div class="medicament-details">
+                        <div class="detail-item">
+                            <span class="detail-label">Quantité</span>
+                            <span class="detail-value">' . htmlspecialchars($ligne->quantite) . '</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Posologie</span>
+                            <span class="detail-value">' . htmlspecialchars($ligne->posologie) . '</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Durée</span>
+                            <span class="detail-value">' . htmlspecialchars($ligne->duree) . '</span>
+                        </div>
+                    </div>
+                </div>';
+    }
+    
+    $html .= '
+            </div>
+            
+            <!-- Pied de page -->
+            <div class="ordonnance-footer">
+                <div class="print-info">
+                    <p>Imprimé le ' . now()->format('d/m/Y à H:i') . '</p>
+                    <p>Système de gestion pharmaceutique</p>
+                </div>
+                
+                <div class="signature-section">
+                    <span class="signature-label">Signature et cachet du médecin</span>
+                    <div class="signature-line"></div>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>';
+    
+    return $html;
+}
+
+public function generatePdf(Ordonnance $ordonnance)
+{
+    try {
+        // Charger les relations
+        $ordonnance->load(['medecin', 'client', 'lignes']);
+        
+        $html = $this->buildPrintableHtml($ordonnance);
+        
+        $pdf = new \Dompdf\Dompdf([
+            'defaultFont' => 'Arial',
+            'defaultFontSize' => 12,
+            'isRemoteEnabled' => false,
+            'isPhpEnabled' => false,
+            'isHtml5ParserEnabled' => true, 
+            'isFontSubsettingEnabled' => true, 
+            'tempDir' => sys_get_temp_dir(), 
+        ]);
+        
+        $pdf->loadHtml($html, 'UTF-8'); 
+        
+        $pdf->setPaper('A4', 'portrait');
+        $pdf->getOptions()->set([
+            'defaultMediaType' => 'print', 
+            'isFontSubsettingEnabled' => true,
+        ]);
+        
+        $pdf->render();
+        
+        // Nom du fichier
+        $filename = 'ordonnance_' . $ordonnance->numero_ordonnance . '_' . date('Y-m-d') . '.pdf';
+        
+        return response($pdf->output(), 200)
+            ->header('Content-Type', 'application/pdf')
+            ->header('Content-Disposition', 'attachment; filename="' . $filename . '"')
+            ->header('Cache-Control', 'no-cache, no-store, must-revalidate') 
+            ->header('Pragma', 'no-cache') 
+            ->header('Expires', '0'); 
+            
+    } catch (Exception $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Erreur lors de la génération du PDF',
+            'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+        ], 500);
+    }
+}
+
+    /**
+     * Récupérer la liste des médicaments qui ont des ordonnances
+     */
+    public function getMedicamentsAvecOrdonnances(Request $request): JsonResponse
+    {
+        // Vérifier la sélection du dossier
+        $folderCheck = $this->checkDossierSelection($request);
+        if ($folderCheck) return $folderCheck;
+
+        try {
+            $currentDossier = $request->get('current_dossier_vente');
+
+            $medicaments = DB::table('ordonnance_lignes')
+                ->join('ordonnances', 'ordonnance_lignes.ordonnance_id', '=', 'ordonnances.id')
+                ->where('ordonnances.dossier_vente', $currentDossier) // FILTRE PAR DOSSIER
+                ->select('ordonnance_lignes.designation')
+                ->selectRaw('COUNT(DISTINCT ordonnances.id) as total_ordonnances')
+                ->groupBy('ordonnance_lignes.designation')
+                ->orderBy('ordonnance_lignes.designation')
+                ->get();
+
+            return response()->json([
+                'success' => true,
+                'data' => $medicaments,
+                'current_dossier' => $currentDossier,
+                'message' => 'Liste des médicaments récupérée avec succès'
+            ]);
+
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la récupération des médicaments',
+                'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+    /**
+     * Récupérer l'historique des ordonnances 
+     */
+    public function getHistoriqueParMedicament(Request $request): JsonResponse
+    {
+        // Vérifier la sélection du dossier
+        $folderCheck = $this->checkDossierSelection($request);
+        if ($folderCheck) return $folderCheck;
+
+        try {
+            $validated = $request->validate([
+                'medicament' => 'nullable|string',
+                'date' => 'nullable|date',
+                'page' => 'nullable|integer|min:1',
+                'per_page' => 'nullable|integer|min:1|max:100'
+            ]);
+
+            $perPage = $validated['per_page'] ?? 10;
+            $medicament = $validated['medicament'] ?? null;
+            $dateFiltre = $validated['date'] ?? null;
+            $currentDossier = $request->get('current_dossier_vente');
+
+            if (!$medicament && !$dateFiltre) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Veuillez fournir au moins un critère de recherche (médicament ou date)',
+                    'errors' => ['criteres' => 'Au moins un critère de recherche est requis']
+                ], 422);
+            }
+
+            $query = Ordonnance::with(['medecin', 'client', 'lignes']);
+
+            if ($medicament) {
+                $query->whereHas('lignes', function ($q) use ($medicament) {
+                    $q->where('designation', $medicament);
+                });
+            }
+
+            if ($dateFiltre) {
+                $query->whereDate('date', $dateFiltre);
+            }
+
+            $ordonnances = $query->orderBy('date', 'desc')->orderBy('created_at', 'desc')
+                                ->paginate($perPage);
+
+            // Compter le total avec les mêmes critères
+            $queryCount = Ordonnance::query();
+            
+            if ($medicament) {
+                $queryCount->whereHas('lignes', function ($q) use ($medicament) {
+                    $q->where('designation', $medicament);
+                });
+            }
+
+            if ($dateFiltre) {
+                $queryCount->whereDate('date', $dateFiltre);
+            }
+
+            $totalOrdonnances = $queryCount->count();
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'ordonnances' => $ordonnances->items(),
+                    'pagination' => [
+                        'current_page' => $ordonnances->currentPage(),
+                        'last_page' => $ordonnances->lastPage(),
+                        'per_page' => $ordonnances->perPage(),
+                        'total' => $ordonnances->total(),
+                        'from' => $ordonnances->firstItem(),
+                        'to' => $ordonnances->lastItem(),
+                    ],
+                    'total_ordonnances' => $totalOrdonnances,
+                    'medicament_recherche' => $medicament,
+                    'date_filtre' => $dateFiltre,
+                    'current_dossier' => $currentDossier,
+                    'criteres_recherche' => [
+                        'par_medicament' => !empty($medicament),
+                        'par_date' => !empty($dateFiltre),
+                        'les_deux' => !empty($medicament) && !empty($dateFiltre)
+                    ]
+                ],
+                'message' => 'Historique récupéré avec succès'
+            ]);
+
+        } catch (ValidationException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Paramètres de recherche invalides',
+                'errors' => $e->errors()
+            ], 422);
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la récupération de l\'historique',
+                'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+    /**
+     * Récupérer la liste des médecins pour sélection 
+     */
+    public function getMedecinsForSelection(): JsonResponse
+    {
+        try {
+            $medecins = Medecin::select('id', 'nom_complet', 'ONM')
+                               ->orderBy('nom_complet')
+                               ->get()
+                               ->map(function($medecin) {
+                                   return [
+                                       'id' => $medecin->id,
+                                       'label' => $medecin->nom_complet . ' (' . $medecin->ONM . ')',
+                                       'nom_complet' => $medecin->nom_complet,
+                                       'ONM' => $medecin->ONM
+                                   ];
+                               });
+            
+            return response()->json([
+                'success' => true,
+                'data' => $medecins,
+                'message' => 'Liste des médecins récupérée avec succès'
+            ]);
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la récupération des médecins',
+                'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+    /**
+     * Suggérer un numéro d'ordonnance pour le dossier actuel
+     */
+    public function suggestNumeroOrdonnance(Request $request): JsonResponse
+    {
+        // Vérifier la sélection du dossier
+        $folderCheck = $this->checkDossierSelection($request);
+        if ($folderCheck) return $folderCheck;
+
+        try {
+            $currentDossier = $request->get('current_dossier_vente');
+            $suggestion = Ordonnance::suggestNumeroOrdonnance($currentDossier);
+
+            return response()->json([
+                'success' => true,
+                'data' => [
+                    'numero_suggere' => $suggestion,
+                    'dossier' => $currentDossier
+                ],
+                'message' => 'Numéro d\'ordonnance suggéré'
+            ]);
+
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la suggestion du numéro',
+                'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+    /**
+     * Statistiques du dossier actuel
+     */
+    public function getStatistiquesDossier(Request $request): JsonResponse
+    {
+        // Vérifier la sélection du dossier
+        $folderCheck = $this->checkDossierSelection($request);
+        if ($folderCheck) return $folderCheck;
+
+        try {
+            $currentDossier = $request->get('current_dossier_vente');
+            $dossierInfo = $request->get('dossier_info', []);
+
+            $stats = [
+                'dossier_nom' => $currentDossier,
+                'dossier_info' => $dossierInfo,
+                'total_ordonnances' => Ordonnance::count(),
+                'ordonnances_ce_mois' => Ordonnance::whereMonth('date', now()->month)
+                                                  ->whereYear('date', now()->year)
+                                                  ->count(),
+                'ordonnances_aujourd_hui' => Ordonnance::whereDate('date', today())->count(),
+                'derniere_ordonnance' => Ordonnance::orderBy('created_at', 'desc')->first(),
+                'medicaments_uniques' => DB::table('ordonnance_lignes')
+                    ->join('ordonnances', 'ordonnance_lignes.ordonnance_id', '=', 'ordonnances.id')
+                    ->where('ordonnances.dossier_vente', $currentDossier)
+                    ->distinct('ordonnance_lignes.designation')
+                    ->count('ordonnance_lignes.designation')
+            ];
+
+            return response()->json([
+                'success' => true,
+                'data' => $stats,
+                'message' => 'Statistiques du dossier récupérées'
+            ]);
+
+        } catch (Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Erreur lors de la récupération des statistiques',
+                'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+            ], 500);
+        }
+    }
+
+/**
+ * Recherche rapide de médicaments pour l'autocomplétion
+ */
+public function searchMedicamentsRapide(Request $request): JsonResponse
+{
+    // Vérifier la sélection du dossier
+    $folderCheck = $this->checkDossierSelection($request);
+    if ($folderCheck) return $folderCheck;
+
+    try {
+        $validated = $request->validate([
+            'q' => 'required|string|min:2|max:100',
+            'limit' => 'nullable|integer|min:1|max:20'
+        ]);
+
+        $query = $validated['q'];
+        $limit = $validated['limit'] ?? 10;
+        $currentDossier = $request->get('current_dossier_vente');
+
+        $medicaments = DB::table('ordonnance_lignes')
+            ->join('ordonnances', 'ordonnance_lignes.ordonnance_id', '=', 'ordonnances.id')
+            ->where('ordonnances.dossier_vente', $currentDossier)
+            ->where('ordonnance_lignes.designation', 'LIKE', '%' . $query . '%')
+            ->select(
+                'ordonnance_lignes.designation',
+                DB::raw('COUNT(DISTINCT ordonnances.id) as total_ordonnances'),
+                DB::raw('MAX(ordonnances.date) as derniere_utilisation')
+            )
+            ->groupBy('ordonnance_lignes.designation')
+            ->orderByRaw('COUNT(DISTINCT ordonnances.id) DESC') // Plus utilisés en premier
+            ->orderBy('ordonnance_lignes.designation')
+            ->limit($limit)
+            ->get();
+
+        return response()->json([
+            'success' => true,
+            'data' => $medicaments,
+            'query' => $query,
+            'current_dossier' => $currentDossier,
+            'message' => "Suggestions trouvées pour '$query'"
+        ]);
+
+    } catch (ValidationException $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Paramètres de recherche invalides',
+            'errors' => $e->errors()
+        ], 422);
+    } catch (Exception $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Erreur lors de la recherche de médicaments',
+            'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+        ], 500);
+    }
+}
+
+public function getHistoriqueParMedicamentLibre(Request $request): JsonResponse
+{
+    // Vérifier la sélection du dossier
+    $folderCheck = $this->checkDossierSelection($request);
+    if ($folderCheck) return $folderCheck;
+
+    try {
+        $validated = $request->validate([
+            'medicament_libre' => 'nullable|string|min:2|max:255',
+            'medicament' => 'nullable|string|max:255', 
+            'date' => 'nullable|date',
+            'filter_type' => 'nullable|string|in:month,year',
+            'page' => 'nullable|integer|min:1',
+            'per_page' => 'nullable|integer|min:1|max:100'
+        ]);
+
+        $perPage = $validated['per_page'] ?? 10;
+        $medicamentLibre = $validated['medicament_libre'] ?? null;
+        $medicamentExact = $validated['medicament'] ?? null;
+        $dateFiltre = $validated['date'] ?? null;
+        $filterType = $validated['filter_type'] ?? null; 
+        $currentDossier = $request->get('current_dossier_vente');
+
+        // Vérifier qu'au moins un critère est fourni
+        if (!$medicamentLibre && !$medicamentExact && !$dateFiltre) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Veuillez fournir au moins un critère de recherche (médicament ou date)',
+                'errors' => ['criteres' => 'Au moins un critère de recherche est requis']
+            ], 422);
+        }
+
+        $query = Ordonnance::with(['medecin', 'client', 'lignes']);
+
+        // Recherche libre 
+        if ($medicamentLibre) {
+            $query->whereHas('lignes', function ($q) use ($medicamentLibre) {
+                $q->where('designation', 'LIKE', '%' . $medicamentLibre . '%');
+            });
+            
+            // Ajouter le médicament principal pour l'affichage
+            $query->with(['lignes' => function ($q) use ($medicamentLibre) {
+                $q->where('designation', 'LIKE', '%' . $medicamentLibre . '%');
+            }]);
+        }
+
+        if ($medicamentExact) {
+            $query->whereHas('lignes', function ($q) use ($medicamentExact) {
+                $q->where('designation', $medicamentExact);
+            });
+        }
+        if ($dateFiltre) {
+            $date = \Carbon\Carbon::parse($dateFiltre);
+            
+            if (!$filterType) {
+                if (($medicamentLibre || $medicamentExact) && $date->month == 1 && $date->day == 1) {
+                    $filterType = 'year';
+                } else {
+                    $filterType = 'month';
+                }
+            }
+            
+            if ($filterType === 'year') {
+                $query->whereYear('date', $date->year);
+            } else {
+                $query->whereYear('date', $date->year)
+                      ->whereMonth('date', $date->month);
+            }
+        }
+
+        $ordonnances = $query->orderBy('date', 'desc')
+                            ->orderBy('created_at', 'desc')
+                            ->paginate($perPage);
+
+        // Compter le total pour les statistiques
+        $queryCount = Ordonnance::query();
+        
+        if ($medicamentLibre) {
+            $queryCount->whereHas('lignes', function ($q) use ($medicamentLibre) {
+                $q->where('designation', 'LIKE', '%' . $medicamentLibre . '%');
+            });
+        }
+
+        if ($medicamentExact) {
+            $queryCount->whereHas('lignes', function ($q) use ($medicamentExact) {
+                $q->where('designation', $medicamentExact);
+            });
+        }
+
+        if ($dateFiltre) {
+            $date = \Carbon\Carbon::parse($dateFiltre);
+            
+            if (!$filterType) {
+                if (($medicamentLibre || $medicamentExact) && $date->month == 1 && $date->day == 1) {
+                    $filterType = 'year';
+                } else {
+                    $filterType = 'month';
+                }
+            }
+            
+            if ($filterType === 'year') {
+                $queryCount->whereYear('date', $date->year);
+            } else {
+                $queryCount->whereYear('date', $date->year)
+                           ->whereMonth('date', $date->month);
+            }
+        }
+
+        $totalOrdonnances = $queryCount->count();
+
+        $ordonnances->getCollection()->transform(function ($ordonnance) use ($medicamentLibre, $medicamentExact) {
+         
+            if ($medicamentLibre) {
+                $medicamentTrouve = $ordonnance->lignes->first(function ($ligne) use ($medicamentLibre) {
+                    return stripos($ligne->designation, $medicamentLibre) !== false;
+                });
+                $ordonnance->medicament_principal = $medicamentTrouve ? $medicamentTrouve->designation : 'Médicament trouvé';
+            } elseif ($medicamentExact) {
+                $ordonnance->medicament_principal = $medicamentExact;
+            }
+            
+            return $ordonnance;
+        });
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'ordonnances' => $ordonnances->items(),
+                'pagination' => [
+                    'current_page' => $ordonnances->currentPage(),
+                    'last_page' => $ordonnances->lastPage(),
+                    'per_page' => $ordonnances->perPage(),
+                    'total' => $ordonnances->total(),
+                    'from' => $ordonnances->firstItem(),
+                    'to' => $ordonnances->lastItem(),
+                ],
+                'total_ordonnances' => $totalOrdonnances,
+                'medicament_libre' => $medicamentLibre,
+                'medicament_exact' => $medicamentExact,
+                'date_filtre' => $dateFiltre,
+                'filter_type' => $filterType, // NOUVEAU
+                'current_dossier' => $currentDossier,
+                'type_recherche' => $medicamentLibre ? 'libre' : ($medicamentExact ? 'exacte' : 'date_seulement'),
+                'criteres_recherche' => [
+                    'par_medicament_libre' => !empty($medicamentLibre),
+                    'par_medicament_exact' => !empty($medicamentExact),
+                    'par_date' => !empty($dateFiltre),
+                    'filtre_annuel' => $filterType === 'year', // NOUVEAU
+                    'filtre_mensuel' => $filterType === 'month', // NOUVEAU
+                    'recherche_combinee' => (!empty($medicamentLibre) || !empty($medicamentExact)) && !empty($dateFiltre)
+                ]
+            ],
+            'message' => 'Historique récupéré avec succès (recherche libre)'
+        ]);
+
+    } catch (ValidationException $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Paramètres de recherche invalides',
+            'errors' => $e->errors()
+        ], 422);
+    } catch (Exception $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Erreur lors de la récupération de l\'historique libre',
+            'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+        ], 500);
+    }
+}
+
+public function getStatistiquesMedicament(Request $request): JsonResponse
+{
+    // Vérifier la sélection du dossier
+    $folderCheck = $this->checkDossierSelection($request);
+    if ($folderCheck) return $folderCheck;
+
+    try {
+        $validated = $request->validate([
+            'medicament' => 'required|string|min:2|max:255'
+        ]);
+
+        $medicament = $validated['medicament'];
+        $currentDossier = $request->get('current_dossier_vente');
+
+        // Statistiques détaillées du médicament
+        $stats = DB::table('ordonnance_lignes')
+            ->join('ordonnances', 'ordonnance_lignes.ordonnance_id', '=', 'ordonnances.id')
+            ->join('clients', 'ordonnances.client_id', '=', 'clients.id')
+            ->join('medecins', 'ordonnances.medecin_id', '=', 'medecins.id')
+            ->where('ordonnances.dossier_vente', $currentDossier)
+            ->where('ordonnance_lignes.designation', 'LIKE', '%' . $medicament . '%')
+            ->select([
+                DB::raw('COUNT(DISTINCT ordonnances.id) as total_ordonnances'),
+                DB::raw('COUNT(ordonnance_lignes.id) as total_prescriptions'),
+                DB::raw('SUM(ordonnance_lignes.quantite) as quantite_totale'),
+                DB::raw('AVG(ordonnance_lignes.quantite) as quantite_moyenne'),
+                DB::raw('MIN(ordonnances.date) as premiere_prescription'),
+                DB::raw('MAX(ordonnances.date) as derniere_prescription'),
+                DB::raw('COUNT(DISTINCT clients.id) as patients_uniques'),
+                DB::raw('COUNT(DISTINCT medecins.id) as medecins_prescripteurs')
+            ])
+            ->first();
+
+        $posologies = DB::table('ordonnance_lignes')
+            ->join('ordonnances', 'ordonnance_lignes.ordonnance_id', '=', 'ordonnances.id')
+            ->where('ordonnances.dossier_vente', $currentDossier)
+            ->where('ordonnance_lignes.designation', 'LIKE', '%' . $medicament . '%')
+            ->select('ordonnance_lignes.posologie', DB::raw('COUNT(*) as utilisation_count'))
+            ->groupBy('ordonnance_lignes.posologie')
+            ->orderBy('utilisation_count', 'desc')
+            ->limit(5)
+            ->get();
+
+        // Évolution mensuelle des prescriptions 
+        $evolutionMensuelle = DB::table('ordonnance_lignes')
+            ->join('ordonnances', 'ordonnance_lignes.ordonnance_id', '=', 'ordonnances.id')
+            ->where('ordonnances.dossier_vente', $currentDossier)
+            ->where('ordonnance_lignes.designation', 'LIKE', '%' . $medicament . '%')
+            ->where('ordonnances.date', '>=', now()->subMonths(6))
+            ->select(
+                DB::raw('YEAR(ordonnances.date) as annee'),
+                DB::raw('MONTH(ordonnances.date) as mois'),
+                DB::raw('COUNT(*) as prescriptions'),
+                DB::raw('SUM(ordonnance_lignes.quantite) as quantite_totale')
+            )
+            ->groupBy('annee', 'mois')
+            ->orderBy('annee', 'desc')
+            ->orderBy('mois', 'desc')
+            ->get();
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'medicament_recherche' => $medicament,
+                'statistiques_generales' => $stats,
+                'posologies_frequentes' => $posologies,
+                'evolution_mensuelle' => $evolutionMensuelle,
+                'current_dossier' => $currentDossier
+            ],
+            'message' => "Statistiques détaillées pour '$medicament'"
+        ]);
+
+    } catch (ValidationException $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Paramètres invalides',
+            'errors' => $e->errors()
+        ], 422);
+    } catch (Exception $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Erreur lors du calcul des statistiques',
+            'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+        ], 500);
+    }
+}
+
+/**
+ * Exporter la liste des ordonnances de l'historique en PDF 
+ */
+public function exportHistoriqueList(Request $request)
+{
+    // Vérifier la sélection du dossier
+    $folderCheck = $this->checkDossierSelection($request);
+    if ($folderCheck) return $folderCheck;
+
+    try {
+        $validated = $request->validate([
+            'medicament' => 'nullable|string',
+            'date' => 'nullable|date',
+            'filter_type' => 'nullable|string|in:month,year', // NOUVEAU PARAMÈTRE
+            'titre' => 'nullable|string',
+            'format' => 'nullable|string|in:pdf'
+        ]);
+
+        $medicament = $validated['medicament'] ?? null;
+        $dateFiltre = $validated['date'] ?? null;
+        $filterType = $validated['filter_type'] ?? null; // NOUVEAU
+        $titre = $validated['titre'] ?? 'Liste des ordonnances';
+        $currentDossier = $request->get('current_dossier_vente');
+
+        if (!$medicament && !$dateFiltre) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Au moins un critère de recherche est requis (médicament ou date)'
+            ], 422);
+        }
+        $query = Ordonnance::with(['medecin', 'client', 'lignes']);
+
+        if ($medicament) {
+            $query->whereHas('lignes', function ($q) use ($medicament) {
+                $q->where('designation', 'LIKE', '%' . $medicament . '%'); 
+            });
+        }
+
+        if ($dateFiltre) {
+            $date = \Carbon\Carbon::parse($dateFiltre);
+            
+            if (!$filterType) {
+                if ($medicament && $date->month == 1 && $date->day == 1) {
+                    $filterType = 'year';
+                } else {
+                    $filterType = 'month';
+                }
+            }
+            
+            if ($filterType === 'year') {
+                $query->whereYear('date', $date->year);
+            } else {
+                $query->whereYear('date', $date->year)
+                      ->whereMonth('date', $date->month);
+            }
+        }
+
+        $ordonnances = $query->orderBy('date', 'desc')
+                            ->orderBy('created_at', 'desc')
+                            ->get();
+
+        if ($ordonnances->isEmpty()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Aucune ordonnance trouvée pour ces critères'
+            ], 404);
+        }
+
+        $html = $this->buildHistoriqueListHtml($ordonnances, $titre, $medicament, $dateFiltre, $currentDossier, $filterType);
+
+        if ($validated['format'] === 'pdf') {
+            if (!class_exists('\Dompdf\Dompdf')) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'PDF export non disponible. Veuillez installer dompdf: composer require dompdf/dompdf'
+                ], 500);
+            }
+
+            $pdf = new \Dompdf\Dompdf([
+                'defaultFont' => 'Arial',
+                'isRemoteEnabled' => false,
+                'isPhpEnabled' => false
+            ]);
+            
+            $pdf->loadHtml($html);
+            $pdf->setPaper('A4', 'portrait');
+            $pdf->render();
+            
+            $filename = 'historique_ordonnances_' . date('Y-m-d_H-i-s') . '.pdf';
+            
+            return response($pdf->output(), 200)
+                ->header('Content-Type', 'application/pdf')
+                ->header('Content-Disposition', 'attachment; filename="' . $filename . '"');
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'html' => $html,
+                'total_ordonnances' => $ordonnances->count(),
+                'criteres' => [
+                    'medicament' => $medicament,
+                    'date' => $dateFiltre,
+                    'filter_type' => $filterType,
+                    'dossier' => $currentDossier
+                ]
+            ],
+            'message' => 'Export généré avec succès'
+        ]);
+
+    } catch (ValidationException $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Paramètres invalides',
+            'errors' => $e->errors()
+        ], 422);
+    } catch (Exception $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Erreur lors de l\'export',
+            'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+        ], 500);
+    }
+}
+
+/**
+ * Imprimer la liste des ordonnances de l'historique
+ */
+public function printHistoriqueList(Request $request)
+{
+    // Vérifier la sélection du dossier
+    $folderCheck = $this->checkDossierSelection($request);
+    if ($folderCheck) return $folderCheck;
+
+    try {
+        $validated = $request->validate([
+            'medicament' => 'nullable|string',
+            'date' => 'nullable|date',
+            'filter_type' => 'nullable|string|in:month,year', 
+            'titre' => 'nullable|string'
+        ]);
+
+        $medicament = $validated['medicament'] ?? null;
+        $dateFiltre = $validated['date'] ?? null;
+        $filterType = $validated['filter_type'] ?? null;
+        $titre = $validated['titre'] ?? 'Liste des ordonnances';
+        $currentDossier = $request->get('current_dossier_vente');
+
+        if (!$medicament && !$dateFiltre) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Au moins un critère de recherche est requis (médicament ou date)'
+            ], 422);
+        }
+
+        // Récupérer les ordonnances
+        $query = Ordonnance::with(['medecin', 'client', 'lignes']);
+
+        if ($medicament) {
+            $query->whereHas('lignes', function ($q) use ($medicament) {
+                $q->where('designation', 'LIKE', '%' . $medicament . '%'); // CORRECTION : Utiliser LIKE comme dans l'historique
+            });
+        }
+
+        if ($dateFiltre) {
+            $date = \Carbon\Carbon::parse($dateFiltre);
+            
+            if (!$filterType) {
+                if ($medicament && $date->month == 1 && $date->day == 1) {
+                    $filterType = 'year';
+                } else {
+                    $filterType = 'month';
+                }
+            }
+            
+            if ($filterType === 'year') {
+                $query->whereYear('date', $date->year);
+            } else {
+                $query->whereYear('date', $date->year)
+                      ->whereMonth('date', $date->month);
+            }
+        }
+
+        $ordonnances = $query->orderBy('date', 'desc')
+                            ->orderBy('created_at', 'desc')
+                            ->get();
+
+        if ($ordonnances->isEmpty()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Aucune ordonnance trouvée pour ces critères'
+            ], 404);
+        }
+
+        // Générer le HTML imprimable
+        $html = $this->buildHistoriqueListHtml($ordonnances, $titre, $medicament, $dateFiltre, $currentDossier, $filterType);
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'html' => $html,
+                'total_ordonnances' => $ordonnances->count(),
+                'criteres' => [
+                    'medicament' => $medicament,
+                    'date' => $dateFiltre,
+                    'filter_type' => $filterType,
+                    'dossier' => $currentDossier
+                ]
+            ],
+            'message' => 'Liste préparée pour impression'
+        ]);
+
+    } catch (ValidationException $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Paramètres invalides',
+            'errors' => $e->errors()
+        ], 422);
+    } catch (Exception $e) {
+        return response()->json([
+            'success' => false,
+            'message' => 'Erreur lors de la préparation d\'impression',
+            'error' => config('app.debug') ? $e->getMessage() : 'Erreur serveur'
+        ], 500);
+    }
+}
+/**
+ * Construire le HTML pour la liste de l'historique
+ */
+private function buildHistoriqueListHtml($ordonnances, $titre, $medicament = null, $dateFiltre = null, $dossier = null)
+{
+    $totalOrdonnances = $ordonnances->count();
+    $dateGeneration = now()->format('d/m/Y à H:i');
+    
+    // Construire les critères de recherche pour l'affichage
+    $criteres = [];
+    if ($medicament) {
+        $criteres[] = "Médicament: " . $medicament;
+    }
+    if ($dateFiltre) {
+        $criteres[] = "Date: " . \Carbon\Carbon::parse($dateFiltre)->format('d/m/Y');
+    }
+    if ($dossier && $dossier !== 'default') {
+        $criteres[] = "Dossier: " . $dossier;
+    }
+    
+    $criteresText = implode(' | ', $criteres);
+
+    $html = '
+    <!DOCTYPE html>
+    <html lang="fr">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>' . htmlspecialchars($titre) . '</title>
+        <style>
+            @media print {
+                @page {
+                    margin: 1.5cm;
+                    size: A4;
+                }
+                body { margin: 0; }
+                .no-print { display: none !important; }
+                .page-break { page-break-before: always; }
+                table { page-break-inside: auto; }
+                tr { page-break-inside: avoid; page-break-after: auto; }
+                thead { display: table-header-group; }
+                tfoot { display: table-footer-group; }
+            }
+            
+            body {
+                font-family: "Arial", sans-serif;
+                font-size: 11pt;
+                line-height: 1.4;
+                color: #000;
+                max-width: 100%;
+                margin: 0;
+                padding: 0;
+                background: white;
+            }
+            
+            .container {
+                max-width: 21cm;
+                margin: 0 auto;
+                padding: 1cm;
+            }
+            
+            .header {
+                text-align: center;
+                border-bottom: 2px solid #2563eb;
+                padding-bottom: 15px;
+                margin-bottom: 20px;
+            }
+            
+            .header h1 {
+                font-size: 13pt;
+                font-weight: bold;
+                color: #1e40af;
+                margin: 0 0 8px 0;
+            }
+            
+            .header .criteres {
+                font-size: 12pt;
+                color: #4b5563;
+                margin: 5px 0;
+            }
+            
+            .header .total {
+                font-size: 13pt;
+                font-weight: bold;
+                color: #059669;
+                margin: 8px 0;
+            }
+            
+            .meta-info {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 20px;
+                padding: 10px;
+                background-color: #f8fafc;
+                border-radius: 4px;
+                font-size: 10pt;
+                color: #6b7280;
+            }
+            
+            .table-container {
+                overflow-x: auto;
+            }
+            
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 0;
+                font-size: 10pt;
+                background: white;
+            }
+            
+            thead th {
+                background-color: #d1d5db;
+                color: white;
+                font-weight: bold;
+                text-align: center;
+                padding: 8px 6px;
+                border: 1px solid #374151;
+                font-size: 9pt;
+            }
+            
+            tbody td {
+                padding: 6px;
+                border: 1px solid #d1d5db;
+                text-align: center;
+                vertical-align: middle;
+                font-size: 9pt;
+            }
+            
+            tbody tr:nth-child(even) {
+                background-color: #f9fafb;
+            }
+            
+            tbody tr:hover {
+                background-color: #e5f3ff;
+            }
+            
+            .ordonnance-numero {
+                font-weight: bold;
+                color: black;
+            }
+            
+            .client-nom {
+                font-weight: 600;
+                color: #1f2937;
+            }
+            
+            .medicament-principal {
+                font-weight: 500;
+                color: #059669;
+            }
+            
+            .date-ordonnance {
+                font-weight: 500;
+                color: #7c2d12;
+            }
+            
+            .medicaments-list {
+                text-align: left;
+                max-width: 250px;
+            }
+            
+            .medicament-item {
+                margin: 2px 0;
+                padding: 2px 4px;
+                background-color: #e0f2fe;
+                border-radius: 3px;
+                font-size: 8pt;
+                display: inline-block;
+                margin-right: 4px;
+            }
+            
+            .footer {
+                margin-top: 30px;
+                border-top: 1px solid #e5e7eb;
+                padding-top: 15px;
+                text-align: center;
+                font-size: 9pt;
+                color: #6b7280;
+            }
+            
+            .summary-box {
+                background-color: #ecfdf5;
+                border: 1px solid #10b981;
+                border-radius: 6px;
+                padding: 12px;
+                margin-bottom: 20px;
+                text-align: center;
+            }
+            
+            .summary-title {
+                font-size: 12pt;
+                font-weight: bold;
+                color: #065f46;
+                margin-bottom: 5px;
+            }
+            
+            .summary-text {
+                font-size: 10pt;
+                color: #047857;
+            }
+            
+            @media print {
+                .table-container {
+                    overflow: visible;
+                }
+                table {
+                    font-size: 9pt;
+                }
+                thead th {
+                    font-size: 8pt;
+                    padding: 6px 4px;
+                }
+                tbody td {
+                    font-size: 8pt;
+                    padding: 4px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <!-- En-tête -->
+            <div class="header">
+                <h1>' . htmlspecialchars($titre) . '</h1>
+                <div class="total">Total: ' . $totalOrdonnances . ' ordonnance(s)</div>
+            </div>
+            
+            <!-- Informations de génération -->
+            <div class="meta-info">
+                <div>Généré le ' . $dateGeneration . '</div>
+                <div>Système de gestion pharmaceutique</div>
+            </div>
+            
+            <!-- Tableau des ordonnances -->
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th style="width: 12%;">N° Ordonnance</th>
+                            <th style="width: 18%;">Patient</th>
+                            <th style="width: 15%;">Médecin</th>
+                            <th style="width: 12%;">Date</th>
+                            <th style="width: 43%;">Médicaments prescrits</th>
+                        </tr>
+                    </thead>
+                    <tbody>';
+
+    foreach ($ordonnances as $ordonnance) {
+        $medicamentsList = '';
+        foreach ($ordonnance->lignes as $ligne) {
+            $medicamentsList .= '<span class="medicament-item">' . 
+                               htmlspecialchars($ligne->designation) . 
+                               ' (Qté: ' . $ligne->quantite . ')</span>';
+        }
+
+        $html .= '
+                        <tr>
+                            <td class="ordonnance-numero">' . htmlspecialchars($ordonnance->numero_ordonnance) . '</td>
+                            <td class="client-nom">' . htmlspecialchars($ordonnance->client->nom_complet) . '</td>
+                            <td>Dr. ' . htmlspecialchars($ordonnance->medecin->nom_complet) . '</td>
+                            <td class="date-ordonnance">' . $ordonnance->date->format('d/m/Y') . '</td>
+                            <td class="medicaments-list">' . $medicamentsList . '</td>
+                        </tr>';
+    }
+
+    $html .= '
+                    </tbody>
+                </table>
+            </div>
+            
+        </div>
+    </body>
+    </html>';
+
+    return $html;
+}
+}
